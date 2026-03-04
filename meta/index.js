@@ -2,6 +2,7 @@ const YAML = require('yamljs')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { spawn } = require('child_process')
 const _ = require('lodash')
 const { alphanumeric } = require('nanoid-dictionary')
 
@@ -97,10 +98,27 @@ async function start(input) {
 
   safeExecSync(`chmod a+x ${bin}`)
 
-  let pid = safeExecSync(`${bin} -d ${folder} -f ${config} > ${log} 2>&1 &\necho $!`).trim()
+  let pid
+  const logFd = fs.openSync(log, 'a')
+  try {
+    const child = spawn(bin, ['-d', folder, '-f', config], {
+      cwd: folder,
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    })
+
+    await new Promise((resolve, reject) => {
+      child.once('error', reject)
+      child.once('spawn', resolve)
+    })
+
+    child.unref()
+    pid = _.toInteger(child.pid)
+  } finally {
+    fs.closeSync(logFd)
+  }
 
   if (pid) {
-    pid = _.toInteger(pid)
     info.pid = pid
     info.config = config
     info.log = log
@@ -121,7 +139,7 @@ async function stop(_pid) {
   if (_.isArray(_pid) ? !_.isEmpty(_pid) : _pid) {
     let _pids = _.isArray(_pid) ? _pid : [_pid]
     pid = []
-    _.map(_pids, i => {
+    for (const i of _pids) {
       const config = _.get(processes, `${i}.config`)
       const log = _.get(processes, `${i}.log`)
 
@@ -133,21 +151,15 @@ async function stop(_pid) {
       }
 
       safeExecSync(`kill -9 ${i}`)
-
-      const stdout = safeExecSync(`ps -p ${i}`)
-        .trim()
-        .split(/[\r\n]+/)
-        .map(i => i.trim())
-        .filter(i => i.length)
-
-      if (_.chain(stdout).get(1).startsWith(`${i}`).value()) {
+      const alive = await waitForPIDExit(i)
+      if (!_.isEmpty(alive)) {
         pid.push(i)
       } else {
         console.log(`[META] STOPPED\n[PID] ${i}\n[CONFIG] ${config}\n[LOG] ${log}\n`)
         delete processes[i]
         dataFile.write({ ...data, processes })
       }
-    })
+    }
   } else {
     disableAutoClean || safeExecSync(`rm -f ${path.join(tempFolder, `http-meta.*.log`)}`)
     disableAutoClean || safeExecSync(`rm -f ${path.join(tempFolder, `http-meta.*.yaml`)}`)
@@ -158,7 +170,7 @@ async function stop(_pid) {
         safeExecSync(`kill -9 ${i}`)
       })
     }
-    pid = await getPID()
+    pid = await waitForPIDExit(pid)
   }
   if (!_.isEmpty(pid)) {
     throw new Error(`Cannot stop PID: ${pid}`)
@@ -174,6 +186,7 @@ async function getPID(_pid) {
         .map(i => i.trim())
         .filter(i => i.length)
         .map(i => _.toInteger(i))
+        .filter(i => !isZombiePID(i))
         .value()
     : null
   if (!_.isEmpty(_pid)) {
@@ -182,6 +195,23 @@ async function getPID(_pid) {
     return _.intersection(pid, _pids)
   }
   return pid
+}
+
+async function waitForPIDExit(_pid, timeout = 3000, interval = 50) {
+  if (_.isArray(_pid) ? _.isEmpty(_pid) : !_pid) return []
+
+  const start = Date.now()
+  while (Date.now() - start < timeout) {
+    const alive = await getPID(_pid)
+    if (_.isEmpty(alive)) return []
+    await new Promise(resolve => setTimeout(resolve, interval))
+  }
+  return (await getPID(_pid)) || []
+}
+
+function isZombiePID(pid) {
+  const stat = safeExecSync(`ps -o stat= -p ${pid}`).trim()
+  return !!stat && stat.startsWith('Z')
 }
 async function genConfig(input, config) {
   let proxies = _.get(input, 'proxies')
